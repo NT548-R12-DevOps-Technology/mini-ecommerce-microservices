@@ -15,7 +15,7 @@ RUN mvn -B package -DskipTests
 # =========================
 # Runtime stage
 # =========================
-FROM eclipse-temurin:17-jre-jammy
+FROM eclipse-temurin:26.0.1_8-jre-jammy
 WORKDIR /app
 
 COPY --from=build /app/target/*.jar app.jar
