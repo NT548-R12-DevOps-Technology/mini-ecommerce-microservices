@@ -91,6 +91,122 @@ def runServiceTest(Map service) {
             error "No test command configured for service: ${service.name}"
     }
 }
+
+def dependencyScanConfig(Map service) {
+    switch (service.name) {
+        case 'api-gateway':
+        case 'product-service':
+        case 'payment-service':
+        case 'order-service':
+            return [
+                image: 'maven:3.9.6-eclipse-temurin-17',
+                manifest: 'pom.xml',
+                cacheSetup: "mkdir -p \"${env.HOME}/.m2\"",
+                cacheMount: "-v \"${env.HOME}/.m2:/root/.m2\""
+            ]
+
+        case 'user-service':
+        case 'inventory-service':
+            return [
+                image: 'golang:1.25.8-bookworm',
+                manifest: 'go.mod',
+                cacheSetup: "mkdir -p \"${env.HOME}/go/pkg/mod\"",
+                cacheMount: "-v \"${env.HOME}/go/pkg/mod:/go/pkg/mod\""
+            ]
+
+        case 'frontend':
+            return [
+                image: 'node:20-bookworm',
+                manifest: 'package.json',
+                cacheSetup: "mkdir -p \"${env.HOME}/.npm\"",
+                cacheMount: "-v \"${env.HOME}/.npm:/root/.npm\""
+            ]
+
+        default:
+            error "No dependency scan configuration for service: ${service.name}"
+    }
+}
+
+def runSnykDependencyScan(Map service) {
+    def config = dependencyScanConfig(service)
+    def projectName = "${env.PROJECT}-${service.dir}-dependencies"
+    def targetReference = env.BRANCH_NAME ?: 'main'
+
+    withCredentials([
+        string(
+            credentialsId: 'snyk-token',
+            variable: 'SNYK_TOKEN'
+        )
+    ]) {
+        sh """
+          set +e
+          ${config.cacheSetup}
+
+          run_snyk() {
+            docker run --rm \\
+              --entrypoint /usr/local/bin/snyk \\
+              -e SNYK_TOKEN \\
+              -v /usr/local/bin/snyk:/usr/local/bin/snyk:ro \\
+              -v \"${env.WORKSPACE}/${service.dir}:/app\" \\
+              ${config.cacheMount} \\
+              -w /app \\
+              ${config.image} \\
+              \"\$@\"
+          }
+
+          run_snyk test \\
+            --file=\"${config.manifest}\" \\
+            --severity-threshold=\"${env.SNYK_SEVERITY}\"
+          SNYK_STATUS=\$?
+
+          run_snyk monitor \\
+            --file=\"${config.manifest}\" \\
+            --project-name=\"${projectName}\" \\
+            --target-reference=\"${targetReference}\" || true
+
+          exit \$SNYK_STATUS
+        """
+    }
+}
+
+def runSonarAnalysis(Map service) {
+    def projectKey = "${env.PROJECT}-${service.dir}"
+    def javaBinariesArg = [
+        'api-gateway',
+        'product-service',
+        'payment-service',
+        'order-service'
+    ].contains(service.name) ? '-Dsonar.java.binaries=target/classes' : ''
+
+    lock(resource: 'sonarqube-analysis') {
+        withCredentials([
+            string(
+                credentialsId: 'sonarqube-token',
+                variable: 'SONAR_TOKEN'
+            )
+        ]) {
+            sh """
+              docker run --rm \\
+                -e SONAR_HOST_URL \\
+                -e SONAR_TOKEN \\
+                -e SONAR_USER_HOME=/tmp/.sonar \\
+                -v \"${env.WORKSPACE}/${service.dir}:/usr/src:ro\" \\
+                ${env.SONAR_SCANNER_IMAGE} \\
+                -Dsonar.projectKey=\"${projectKey}\" \\
+                -Dsonar.projectName=\"${projectKey}\" \\
+                -Dsonar.projectVersion=\"${env.IMAGE_TAG}\" \\
+                -Dsonar.sources=. \\
+                -Dsonar.sourceEncoding=UTF-8 \\
+                -Dsonar.exclusions=\"target/**,node_modules/**,dist/**,build/**\" \\
+                -Dsonar.working.directory=/tmp/.scannerwork \\
+                -Dsonar.qualitygate.wait=true \\
+                -Dsonar.qualitygate.timeout=\"${env.SONAR_QUALITY_GATE_TIMEOUT}\" \\
+                ${javaBinariesArg}
+            """
+        }
+    }
+}
+
 def runParallelForSelected(String stagePrefix, Closure worker) {
     def tasks = [:]
 
@@ -152,6 +268,11 @@ pipeline {
         TRIVY_SOURCE_SEVERITY = "MEDIUM,HIGH,CRITICAL"
         TRIVY_EXIT_CODE      = "1"
         TRIVY_CACHE_DIR      = "${HOME}/.trivy-cache-mini-ecommerce"
+        SNYK_SEVERITY        = "high"
+
+        SONAR_HOST_URL            = "http://10.0.23.10:9000"
+        SONAR_SCANNER_IMAGE       = "sonarsource/sonar-scanner-cli:12.1.0.3233_8.0.1"
+        SONAR_QUALITY_GATE_TIMEOUT = "300"
     }
 
     stages {
@@ -359,6 +480,14 @@ pipeline {
                                     runServiceTest(service)
                                 }
 
+                                stage("Snyk Dependency Scan ${service.name}") {
+                                    runSnykDependencyScan(service)
+                                }
+
+                                stage("SonarQube Analysis ${service.name}") {
+                                    runSonarAnalysis(service)
+                                }
+
                                 stage("Build ${service.name}") {
                                     sh """
                                       DOCKER_BUILDKIT=1 docker build \
@@ -367,6 +496,31 @@ pipeline {
                                         -t ${env.DOCKERHUB_USER}/${env.PROJECT}-${service.image}:latest \
                                         ./${service.dir}
                                     """
+                                }
+
+                                stage("Snyk Container Scan ${service.name}") {
+                                    withCredentials([
+                                        string(
+                                            credentialsId: 'snyk-token',
+                                            variable: 'SNYK_TOKEN'
+                                        )
+                                    ]) {
+                                        sh """
+                                          set +e
+
+                                          snyk container test "${imageRef(service)}" \
+                                            --file="${service.dir}/Dockerfile" \
+                                            --severity-threshold="${env.SNYK_SEVERITY}"
+                                          SNYK_STATUS=\$?
+
+                                          snyk container monitor "${imageRef(service)}" \
+                                            --file="${service.dir}/Dockerfile" \
+                                            --project-name="${env.PROJECT}-${service.image}" \
+                                            --target-reference="${env.BRANCH_NAME ?: 'main'}" || true
+
+                                          exit \$SNYK_STATUS
+                                        """
+                                    }
                                 }
 
                                 stage("Trivy Source Scan ${service.name}") {
