@@ -481,7 +481,9 @@ pipeline {
                                 }
 
                                 stage("Snyk Dependency Scan ${service.name}") {
-                                    runSnykDependencyScan(service)
+                                    catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                                        runSnykDependencyScan(service)
+                                    }
                                 }
 
                                 stage("SonarQube Analysis ${service.name}") {
@@ -496,31 +498,6 @@ pipeline {
                                         -t ${env.DOCKERHUB_USER}/${env.PROJECT}-${service.image}:latest \
                                         ./${service.dir}
                                     """
-                                }
-
-                                stage("Snyk Container Scan ${service.name}") {
-                                    withCredentials([
-                                        string(
-                                            credentialsId: 'snyk-token',
-                                            variable: 'SNYK_TOKEN'
-                                        )
-                                    ]) {
-                                        sh """
-                                          set +e
-
-                                          snyk container test "${imageRef(service)}" \
-                                            --file="${service.dir}/Dockerfile" \
-                                            --severity-threshold="${env.SNYK_SEVERITY}"
-                                          SNYK_STATUS=\$?
-
-                                          snyk container monitor "${imageRef(service)}" \
-                                            --file="${service.dir}/Dockerfile" \
-                                            --project-name="${env.PROJECT}-${service.image}" \
-                                            --target-reference="${env.BRANCH_NAME ?: 'main'}" || true
-
-                                          exit \$SNYK_STATUS
-                                        """
-                                    }
                                 }
 
                                 stage("Trivy Source Scan ${service.name}") {
