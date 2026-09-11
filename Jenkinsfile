@@ -261,7 +261,7 @@ pipeline {
         PROJECT        = "mini-ecommerce"
         IMAGE_TAG      = "${env.GIT_COMMIT.take(7)}"
 
-        GITOPS_REPO = "https://github.com/NT114-Q21-Specialized-Project/kubernetes-hub.git"
+        GITOPS_REPO = "https://github.com/NT548-R12-DevOps-Technology/kubernetes-hub.git"
         GITOPS_DIR  = "kubernetes-hub"
 
         TRIVY_SEVERITY       = "HIGH,CRITICAL"
