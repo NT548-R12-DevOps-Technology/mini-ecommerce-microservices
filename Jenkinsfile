@@ -52,10 +52,10 @@ def runServiceTest(Map service) {
         case 'payment-service':
         case 'order-service':
             sh """
-              mkdir -p "\$HOME/.m2"
+              mkdir -p "\$HOME/.m2/${service.name}"
               docker run --rm \\
                 -v "\$PWD/${service.dir}:/app" \\
-                -v "\$HOME/.m2:/root/.m2" \\
+                -v "\$HOME/.m2/${service.name}:/root/.m2" \\
                 -w /app \\
                 ${testImage} \\
                 mvn -B clean test
@@ -101,8 +101,8 @@ def dependencyScanConfig(Map service) {
             return [
                 image: 'maven:3.9.6-eclipse-temurin-17',
                 manifest: 'pom.xml',
-                cacheSetup: "mkdir -p \"${env.HOME}/.m2\"",
-                cacheMount: "-v \"${env.HOME}/.m2:/root/.m2\""
+                cacheSetup: "mkdir -p \"${env.HOME}/.m2/${service.name}\"",
+                cacheMount: "-v \"${env.HOME}/.m2/${service.name}:/root/.m2\""
             ]
 
         case 'user-service':
@@ -131,6 +131,7 @@ def runSnykDependencyScan(Map service) {
     def config = dependencyScanConfig(service)
     def projectName = "${env.PROJECT}-${service.dir}-dependencies"
     def targetReference = env.BRANCH_NAME ?: 'main'
+    def reportFile = "${service.name}.json"
 
     withCredentials([
         string(
@@ -141,6 +142,7 @@ def runSnykDependencyScan(Map service) {
         sh """
           set +e
           ${config.cacheSetup}
+          mkdir -p "${env.WORKSPACE}/${env.SNYK_REPORT_DIR}"
 
           run_snyk() {
             docker run --rm \\
@@ -148,6 +150,7 @@ def runSnykDependencyScan(Map service) {
               -e SNYK_TOKEN \\
               -v /usr/local/bin/snyk:/usr/local/bin/snyk:ro \\
               -v \"${env.WORKSPACE}/${service.dir}:/app\" \\
+              -v \"${env.WORKSPACE}/${env.SNYK_REPORT_DIR}:/snyk-reports\" \\
               ${config.cacheMount} \\
               -w /app \\
               ${config.image} \\
@@ -156,7 +159,8 @@ def runSnykDependencyScan(Map service) {
 
           run_snyk test \\
             --file=\"${config.manifest}\" \\
-            --severity-threshold=\"${env.SNYK_SEVERITY}\"
+            --severity-threshold=\"${env.SNYK_SEVERITY}\" \\
+            --json-file-output=\"/snyk-reports/${reportFile}\"
           SNYK_STATUS=\$?
 
           run_snyk monitor \\
@@ -249,6 +253,45 @@ def cleanupBuiltImages() {
 }
 
 
+def publishSnykReport() {
+    def reportsFound = sh(
+        script: "find '${env.SNYK_REPORT_DIR}' -maxdepth 1 -name '*.json' -print -quit | grep -q .",
+        returnStatus: true
+    ) == 0
+
+    if (!reportsFound) {
+        echo 'No Snyk JSON reports were generated; skipping CSV report and Telegram notification.'
+        return
+    }
+
+    env.SNYK_PIPELINE_RESULT = currentBuild.currentResult
+    sh '''python3 scripts/render-snyk-report.py \
+      "${SNYK_REPORT_DIR}" \
+      "${SNYK_CSV_REPORT}"'''
+
+    archiveArtifacts artifacts: env.SNYK_CSV_REPORT, allowEmptyArchive: false, fingerprint: true
+
+    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+        withCredentials([
+            string(credentialsId: 'snyk-telegram-bot-token', variable: 'SNYK_TELEGRAM_BOT_TOKEN'),
+            string(credentialsId: 'snyk-telegram-chat-id', variable: 'SNYK_TELEGRAM_CHAT_ID')
+        ]) {
+            sh '''
+              set +x
+              curl --fail --silent --show-error \
+                --retry 3 \
+                --connect-timeout 10 \
+                --max-time 60 \
+                --request POST \
+                "https://api.telegram.org/bot${SNYK_TELEGRAM_BOT_TOKEN}/sendDocument" \
+                --form-string "chat_id=${SNYK_TELEGRAM_CHAT_ID}" \
+                --form "document=@${SNYK_CSV_REPORT};type=text/csv" \
+                --form-string "caption=Snyk dependency report | ${JOB_NAME} #${BUILD_NUMBER} | ${SNYK_PIPELINE_RESULT} | ${BRANCH_NAME:-unknown} | ${BUILD_URL}"
+            '''
+        }
+    }
+}
+
 def publishTrivyReport() {
     def reportsFound = sh(
         script: "find '${env.TRIVY_REPORT_DIR}' -maxdepth 1 -name '*.json' -print -quit | grep -q .",
@@ -270,8 +313,8 @@ def publishTrivyReport() {
     // A notification outage must not hide the CI result or stop cleanup.
     catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
         withCredentials([
-            string(credentialsId: 'telegram-bot-token', variable: 'TELEGRAM_BOT_TOKEN'),
-            string(credentialsId: 'telegram-chat-id', variable: 'TELEGRAM_CHAT_ID')
+            string(credentialsId: 'trivy-telegram-bot-token', variable: 'TRIVY_TELEGRAM_BOT_TOKEN'),
+            string(credentialsId: 'trivy-telegram-chat-id', variable: 'TRIVY_TELEGRAM_CHAT_ID')
         ]) {
             sh '''
               set +x
@@ -280,8 +323,8 @@ def publishTrivyReport() {
                 --connect-timeout 10 \
                 --max-time 60 \
                 --request POST \
-                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-                --form-string "chat_id=${TELEGRAM_CHAT_ID}" \
+                "https://api.telegram.org/bot${TRIVY_TELEGRAM_BOT_TOKEN}/sendDocument" \
+                --form-string "chat_id=${TRIVY_TELEGRAM_CHAT_ID}" \
                 --form "document=@${TRIVY_HTML_REPORT};type=text/html" \
                 --form-string "caption=Trivy report | ${JOB_NAME} #${BUILD_NUMBER} | ${TRIVY_PIPELINE_RESULT} | ${BRANCH_NAME:-unknown} | ${BUILD_URL}"
             '''
@@ -312,6 +355,8 @@ pipeline {
         TRIVY_REPORT_DIR      = "reports/trivy"
         TRIVY_HTML_REPORT     = "reports/trivy/trivy-report_${env.BUILD_NUMBER}.html"
         SNYK_SEVERITY         = "high"
+        SNYK_REPORT_DIR       = "reports/snyk"
+        SNYK_CSV_REPORT       = "reports/snyk/snyk-report_${env.BUILD_NUMBER}.csv"
 
         SONAR_HOST_URL            = "http://10.0.23.10:9000"
         SONAR_SCANNER_IMAGE       = "sonarsource/sonar-scanner-cli:12.1.0.3233_8.0.1"
@@ -326,6 +371,7 @@ pipeline {
         stage('Checkout App Repo') {
             steps {
                 checkout scm
+                sh 'rm -rf reports/trivy reports/snyk'
             }
         }
 
@@ -497,8 +543,8 @@ pipeline {
             }
             steps {
                 sh """
-                  rm -rf "${env.TRIVY_REPORT_DIR}"
-                  mkdir -p "${env.TRIVY_CACHE_DIR}" "${env.TRIVY_REPORT_DIR}"
+                  rm -rf "${env.TRIVY_REPORT_DIR}" "${env.SNYK_REPORT_DIR}"
+                  mkdir -p "${env.TRIVY_CACHE_DIR}" "${env.TRIVY_REPORT_DIR}" "${env.SNYK_REPORT_DIR}"
                   trivy image --download-db-only --cache-dir "${env.TRIVY_CACHE_DIR}"
                 """
             }
@@ -643,6 +689,7 @@ pipeline {
     post {
         always {
             script {
+                publishSnykReport()
                 publishTrivyReport()
                 cleanupBuiltImages()
             }
