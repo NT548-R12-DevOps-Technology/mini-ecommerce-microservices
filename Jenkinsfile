@@ -248,6 +248,47 @@ def cleanupBuiltImages() {
     sh 'docker system prune -f --filter "until=24h" || true'
 }
 
+
+def publishTrivyReport() {
+    def reportsFound = sh(
+        script: "find '${env.TRIVY_REPORT_DIR}' -maxdepth 1 -name '*.json' -print -quit | grep -q .",
+        returnStatus: true
+    ) == 0
+
+    if (!reportsFound) {
+        echo 'No Trivy JSON reports were generated; skipping HTML report and Telegram notification.'
+        return
+    }
+
+    env.TRIVY_PIPELINE_RESULT = currentBuild.currentResult
+    sh '''python3 scripts/render-trivy-report.py \
+      "${TRIVY_REPORT_DIR}" \
+      "${TRIVY_HTML_REPORT}"'''
+
+    archiveArtifacts artifacts: env.TRIVY_HTML_REPORT, allowEmptyArchive: false, fingerprint: true
+
+    // A notification outage must not hide the CI result or stop cleanup.
+    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+        withCredentials([
+            string(credentialsId: 'telegram-bot-token', variable: 'TELEGRAM_BOT_TOKEN'),
+            string(credentialsId: 'telegram-chat-id', variable: 'TELEGRAM_CHAT_ID')
+        ]) {
+            sh '''
+              set +x
+              curl --fail --silent --show-error \
+                --retry 3 \
+                --connect-timeout 10 \
+                --max-time 60 \
+                --request POST \
+                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+                --form-string "chat_id=${TELEGRAM_CHAT_ID}" \
+                --form "document=@${TRIVY_HTML_REPORT};type=text/html" \
+                --form-string "caption=Trivy report | ${JOB_NAME} #${BUILD_NUMBER} | ${TRIVY_PIPELINE_RESULT} | ${BRANCH_NAME:-unknown} | ${BUILD_URL}"
+            '''
+        }
+    }
+}
+
 pipeline {
     agent any
 
@@ -266,9 +307,11 @@ pipeline {
 
         TRIVY_SEVERITY       = "HIGH,CRITICAL"
         TRIVY_SOURCE_SEVERITY = "MEDIUM,HIGH,CRITICAL"
-        TRIVY_EXIT_CODE      = "1"
-        TRIVY_CACHE_DIR      = "${HOME}/.trivy-cache-mini-ecommerce"
-        SNYK_SEVERITY        = "high"
+        TRIVY_EXIT_CODE       = "1"
+        TRIVY_CACHE_DIR       = "${HOME}/.trivy-cache-mini-ecommerce"
+        TRIVY_REPORT_DIR      = "reports/trivy"
+        TRIVY_HTML_REPORT     = "reports/trivy/trivy-report.html"
+        SNYK_SEVERITY         = "high"
 
         SONAR_HOST_URL            = "http://10.0.23.10:9000"
         SONAR_SCANNER_IMAGE       = "sonarsource/sonar-scanner-cli:12.1.0.3233_8.0.1"
@@ -454,8 +497,9 @@ pipeline {
             }
             steps {
                 sh """
-                  mkdir -p ${env.TRIVY_CACHE_DIR}
-                  trivy image --download-db-only --cache-dir ${env.TRIVY_CACHE_DIR}
+                  rm -rf "${env.TRIVY_REPORT_DIR}"
+                  mkdir -p "${env.TRIVY_CACHE_DIR}" "${env.TRIVY_REPORT_DIR}"
+                  trivy image --download-db-only --cache-dir "${env.TRIVY_CACHE_DIR}"
                 """
             }
         }
@@ -504,15 +548,21 @@ pipeline {
                                     catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
                                         lock(resource: 'trivy-cache') {
                                             sh """
-                                              mkdir -p "${env.TRIVY_CACHE_DIR}"
+                                              set +e
+                                              TRIVY_REPORT="${env.TRIVY_REPORT_DIR}/${service.name}-source.json"
                                               trivy fs \
                                                 --skip-db-update \
-                                                --cache-dir ${env.TRIVY_CACHE_DIR} \
-                                                --severity ${env.TRIVY_SOURCE_SEVERITY} \
+                                                --cache-dir "${env.TRIVY_CACHE_DIR}" \
+                                                --severity "${env.TRIVY_SOURCE_SEVERITY}" \
                                                 --scanners vuln \
-                                                --exit-code ${env.TRIVY_EXIT_CODE} \
+                                                --exit-code "${env.TRIVY_EXIT_CODE}" \
                                                 --ignore-unfixed \
+                                                --format json \
+                                                --output "\$TRIVY_REPORT" \
                                                 ./${service.dir}
+                                              TRIVY_STATUS=\$?
+                                              trivy convert --format table "\$TRIVY_REPORT" || true
+                                              exit \$TRIVY_STATUS
                                             """
                                         }
                                     }
@@ -522,14 +572,20 @@ pipeline {
                                     catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
                                         lock(resource: 'trivy-cache') {
                                             sh """
-                                              mkdir -p "${env.TRIVY_CACHE_DIR}"
+                                              set +e
+                                              TRIVY_REPORT="${env.TRIVY_REPORT_DIR}/${service.name}-image.json"
                                               trivy image \
                                                 --skip-db-update \
-                                                --cache-dir ${env.TRIVY_CACHE_DIR} \
-                                                --severity ${env.TRIVY_SEVERITY} \
-                                                --exit-code ${env.TRIVY_EXIT_CODE} \
+                                                --cache-dir "${env.TRIVY_CACHE_DIR}" \
+                                                --severity "${env.TRIVY_SEVERITY}" \
+                                                --exit-code "${env.TRIVY_EXIT_CODE}" \
                                                 --ignore-unfixed \
+                                                --format json \
+                                                --output "\$TRIVY_REPORT" \
                                                 ${imageRef(service)}
+                                              TRIVY_STATUS=\$?
+                                              trivy convert --format table "\$TRIVY_REPORT" || true
+                                              exit \$TRIVY_STATUS
                                             """
                                         }
                                     }
@@ -587,6 +643,7 @@ pipeline {
     post {
         always {
             script {
+                publishTrivyReport()
                 cleanupBuiltImages()
             }
             sh 'docker logout || true'
