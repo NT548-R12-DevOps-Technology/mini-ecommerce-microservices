@@ -129,24 +129,56 @@ def main() -> int:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Trivy report - {esc(metadata['job'])} #{esc(metadata['build'])}</title>
+  <script>
+    (() => {{
+      let savedTheme = null;
+      try {{ savedTheme = localStorage.getItem('trivy-report-theme'); }} catch (_) {{}}
+      const preferredTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      document.documentElement.dataset.theme = savedTheme || preferredTheme;
+    }})();
+  </script>
   <style>
-    :root {{ color-scheme: light dark; --bg:#0f172a; --panel:#111827; --line:#334155; --text:#e5e7eb; --muted:#94a3b8; }}
-    * {{ box-sizing:border-box; }} body {{ margin:0; padding:32px; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,sans-serif; }}
-    main {{ max-width:1500px; margin:auto; }} h1 {{ margin:0 0 8px; }} a {{ color:#60a5fa; }}
+    :root {{
+      color-scheme:light;
+      --bg:#f8fafc; --panel:#ffffff; --panel-strong:#e2e8f0; --line:#cbd5e1;
+      --text:#0f172a; --muted:#64748b; --link:#2563eb; --button-hover:#e2e8f0;
+      --shadow:0 12px 30px rgba(15,23,42,.08);
+    }}
+    :root[data-theme="dark"] {{
+      color-scheme:dark;
+      --bg:#0f172a; --panel:#111827; --panel-strong:#1e293b; --line:#334155;
+      --text:#e5e7eb; --muted:#94a3b8; --link:#60a5fa; --button-hover:#243247;
+      --shadow:0 12px 30px rgba(0,0,0,.24);
+    }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; padding:32px; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,sans-serif; transition:background-color .2s,color .2s; }}
+    main {{ max-width:1500px; margin:auto; }} h1 {{ margin:0 0 8px; }} a {{ color:var(--link); }}
+    .report-header {{ display:flex; align-items:flex-start; justify-content:space-between; gap:20px; }}
+    .theme-toggle {{ display:inline-flex; align-items:center; gap:8px; border:1px solid var(--line); border-radius:999px; padding:9px 13px; background:var(--panel); color:var(--text); box-shadow:var(--shadow); cursor:pointer; font:inherit; font-weight:650; }}
+    .theme-toggle:hover {{ background:var(--button-hover); }} .theme-icon {{ font-size:16px; line-height:1; }}
     .meta,.cards {{ display:flex; flex-wrap:wrap; gap:12px; margin:20px 0; }}
-    .meta span,.card {{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 14px; }}
+    .meta span,.card {{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 14px; box-shadow:var(--shadow); }}
     .card {{ min-width:130px; display:flex; justify-content:space-between; gap:20px; }} .card strong {{ font-size:22px; }}
     .critical strong,.badge.critical {{ color:#f87171; }} .high strong,.badge.high {{ color:#fb923c; }}
     .medium strong,.badge.medium {{ color:#facc15; }} .low strong,.badge.low {{ color:#a3a3a3; }}
-    .badge {{ font-weight:700; }} .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:10px; }}
+    .badge {{ font-weight:700; }} .table-wrap {{ overflow:auto; border:1px solid var(--line); border-radius:10px; box-shadow:var(--shadow); }}
     table {{ width:100%; border-collapse:collapse; background:var(--panel); }} th,td {{ padding:10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
-    th {{ position:sticky; top:0; background:#1e293b; }} td:nth-child(3),td:nth-child(9) {{ min-width:240px; }}
+    th {{ position:sticky; top:0; background:var(--panel-strong); }} td:nth-child(3),td:nth-child(9) {{ min-width:240px; }}
     .muted {{ color:var(--muted); }} .warning {{ color:#facc15; }} .empty {{ padding:30px; background:var(--panel); border-radius:10px; }}
+    @media (max-width:640px) {{ body {{ padding:18px; }} .theme-label {{ display:none; }} }}
+    @media print {{ :root {{ color-scheme:light; --bg:#fff; --panel:#fff; --panel-strong:#f1f5f9; --line:#cbd5e1; --text:#0f172a; --muted:#475569; --link:#1d4ed8; --shadow:none; }} .theme-toggle {{ display:none; }} body {{ padding:0; }} }}
   </style>
 </head>
 <body><main>
-  <h1>Trivy Security Report</h1>
-  <div class="muted">Generated {esc(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'))}</div>
+  <div class="report-header">
+    <div>
+      <h1>Trivy Security Report</h1>
+      <div class="muted">Generated {esc(datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'))}</div>
+    </div>
+    <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch report theme">
+      <span class="theme-icon" aria-hidden="true"></span><span class="theme-label"></span>
+    </button>
+  </div>
   <div class="meta">
     <span>Job: <strong>{esc(metadata['job'])}</strong></span><span>Build: <strong>{build_value}</strong></span>
     <span>Branch: <strong>{esc(metadata['branch'])}</strong></span><span>Commit: <strong>{esc(metadata['commit'])}</strong></span>
@@ -155,7 +187,31 @@ def main() -> int:
   <div class="cards">{cards}</div>
   {invalid_html}
   <div class="table-wrap">{findings_html}</div>
-</main></body></html>
+</main>
+<script>
+  (() => {{
+    const root = document.documentElement;
+    const button = document.getElementById('theme-toggle');
+    const icon = button.querySelector('.theme-icon');
+    const label = button.querySelector('.theme-label');
+
+    const renderButton = () => {{
+      const dark = root.dataset.theme === 'dark';
+      icon.textContent = dark ? '☀️' : '🌙';
+      label.textContent = dark ? 'Light' : 'Dark';
+      button.setAttribute('aria-label', dark ? 'Switch to light theme' : 'Switch to dark theme');
+    }};
+
+    button.addEventListener('click', () => {{
+      root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+      try {{ localStorage.setItem('trivy-report-theme', root.dataset.theme); }} catch (_) {{}}
+      renderButton();
+    }});
+
+    renderButton();
+  }})();
+</script>
+</body></html>
 """
 
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
