@@ -310,7 +310,7 @@ pipeline {
         TRIVY_EXIT_CODE       = "1"
         TRIVY_CACHE_DIR       = "${HOME}/.trivy-cache-mini-ecommerce"
         TRIVY_REPORT_DIR      = "reports/trivy"
-        TRIVY_HTML_REPORT     = "reports/trivy/trivy-report.html"
+        TRIVY_HTML_REPORT     = "reports/trivy/trivy-report_${env.BUILD_NUMBER}.html"
         SNYK_SEVERITY         = "high"
 
         SONAR_HOST_URL            = "http://10.0.23.10:9000"
@@ -653,3 +653,5 @@ pipeline {
         }
     }
 }
+
+//Trigger CI 
